@@ -1,0 +1,10 @@
+cat > .gitignore <<'EOF'
+node_modules/
+.env
+.env.local
+.env.*
+!.env.example
+npm-debug.log*
+yarn-error.log*
+.DS_Store
+EOF
