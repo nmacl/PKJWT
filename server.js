@@ -71,35 +71,49 @@ const sq = s => String(s || "").replace(/'/g, "\\'");
 
 app.post("/webhooks/klaviyo", async (req, res) => {
   try {
-    // OPTIONAL: shared-secret check
-    if (process.env.KLAVIYO_SECRET && req.headers["x-klaviyo-signature"] !== process.env.KLAVIYO_SECRET) {
-      return res.status(401).json({ ok:false, error:"unauthorized" });
-    }
+    const { email, subject, body, orderData } = req.body;
 
-    const { email, subject, body, event, properties } = req.body || {};
-    const tok = await getSfToken();
-    const H = { Authorization: `Bearer ${tok.access_token}` };
-
-    // try to link to a Contact by email
+    // Find Contact or Lead by email
     let whoId = null;
-    if (email) {
-      const q = encodeURIComponent(`SELECT Id FROM Contact WHERE Email='${sq(email)}' LIMIT 1`);
-      const qr = await axios.get(`${tok.instance_url}/services/data/v61.0/query?q=${q}`, { headers: H });
-      whoId = qr.data?.records?.[0]?.Id || null;
+    const contactResult = await conn.query(
+      `SELECT Id FROM Contact WHERE Email = '${email}' LIMIT 1`
+    );
+    if (contactResult.records.length > 0) {
+      whoId = contactResult.records[0].Id;
+    } else {
+      const leadResult = await conn.query(
+        `SELECT Id FROM Lead WHERE Email = '${email}' LIMIT 1`
+      );
+      if (leadResult.records.length > 0) {
+        whoId = leadResult.records[0].Id;
+      }
     }
 
-    const task = {
-      Subject: subject || (event ? `Klaviyo: ${event}` : "Klaviyo Event"),
-      Description: body || (properties ? JSON.stringify(properties, null, 2) : ""),
-      Status: "Completed",
-      Priority: "Normal",
-      ...(whoId ? { WhoId: whoId } : {})
-    };
+    // Format body nicely
+    const orderText = [
+      `Order ID: ${orderData.orderId}`,
+      `Customer: ${orderData.firstName} ${orderData.lastName}`,
+      `Email: ${email}`,
+      `Total: ${orderData.total} ${orderData.currency}`,
+      `Address: ${orderData.address1}, ${orderData.city}, ${orderData.region}, ${orderData.zip}, ${orderData.country}`,
+      ``,
+      `Raw Order Data:`,
+      JSON.stringify(orderData, null, 2)
+    ].join("\n");
 
-    const tr = await axios.post(`${tok.instance_url}/services/data/v61.0/sobjects/Task`, task, { headers: H });
-    res.json({ ok:true, taskId: tr.data.id, linkedTo: whoId });
-  } catch (e) {
-    res.status(500).json({ ok:false, error: e.response?.data || e.message });
+    // Create Task
+    const task = await conn.sobject("Task").create({
+      Subject: subject || `Order: #${orderData.orderId}`,
+      Description: orderText,
+      WhoId: whoId || undefined,
+      Status: "Completed",
+      Priority: "Normal"
+    });
+
+    res.json({ ok: true, taskId: task.id, linkedTo: whoId });
+  } catch (err) {
+    console.error("Error pushing Task to Salesforce:", err);
+    res.status(500).json({ ok: false, error: err });
   }
 });
 
