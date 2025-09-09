@@ -54,13 +54,7 @@ app.post("/auth/sf/jwt/test", async (_, res) => {
   }
 });
 
-// (optional) Klaviyo webhook stub — we’ll wire it up next
-app.post("/webhooks/klaviyo", (req, res) => {
-  console.log("Klaviyo payload:", JSON.stringify(req.body).slice(0, 1000));
-  res.status(202).json({ received: true });
-});
-
-// use your existing getSfToken() from earlier message
+// helper (reuse your buildAssertion)
 async function getSfToken() {
   const assertion = buildAssertion();
   const url = `${process.env.SF_LOGIN_URL}/services/oauth2/token`;
@@ -70,68 +64,45 @@ async function getSfToken() {
   const { data } = await axios.post(url, body.toString(), {
     headers:{ "Content-Type":"application/x-www-form-urlencoded" }
   });
-  return data; // { access_token, instance_url, ... }
+  return data; // { access_token, instance_url }
 }
 
-// 1) Start a bot session
-app.post("/einstein/session/start", async (req, res) => {
-  try {
-    const tok = await getSfToken();
-    const host = process.env.BOT_RUNTIME_BASE_URL; // e.g. https://runtime-api-na-west.prod.chatbots.sfdc.sh
-    const botId = process.env.BOT_ID;
-    const url = `${host}/v5/bots/${botId}/sessions`;
+const sq = s => String(s || "").replace(/'/g, "\\'");
 
-    const payload = {
-      forceConfig: { endpoint: process.env.FORCE_ENDPOINT },
-      externalSessionKey: randomUUID(),
-      message: { text: (req.body && req.body.text) || "Hello" }
+app.post("/webhooks/klaviyo", async (req, res) => {
+  try {
+    // OPTIONAL: shared-secret check
+    if (process.env.KLAVIYO_SECRET && req.headers["x-klaviyo-signature"] !== process.env.KLAVIYO_SECRET) {
+      return res.status(401).json({ ok:false, error:"unauthorized" });
+    }
+
+    const { email, subject, body, event, properties } = req.body || {};
+    const tok = await getSfToken();
+    const H = { Authorization: `Bearer ${tok.access_token}` };
+
+    // try to link to a Contact by email
+    let whoId = null;
+    if (email) {
+      const q = encodeURIComponent(`SELECT Id FROM Contact WHERE Email='${sq(email)}' LIMIT 1`);
+      const qr = await axios.get(`${tok.instance_url}/services/data/v61.0/query?q=${q}`, { headers: H });
+      whoId = qr.data?.records?.[0]?.Id || null;
+    }
+
+    const task = {
+      Subject: subject || (event ? `Klaviyo: ${event}` : "Klaviyo Event"),
+      Description: body || (properties ? JSON.stringify(properties, null, 2) : ""),
+      Status: "Completed",
+      Priority: "Normal",
+      ...(whoId ? { WhoId: whoId } : {})
     };
 
-    const { data } = await axios.post(url, payload, {
-      headers: {
-        Authorization: `Bearer ${tok.access_token}`,
-        "Content-Type": "application/json",
-        "X-Org-Id": process.env.ORG_ID,
-        "X-Request-Id": randomUUID()
-      }
-    });
-
-    res.json({ ok:true, sessionId: data.sessionId, response: data });
+    const tr = await axios.post(`${tok.instance_url}/services/data/v61.0/sobjects/Task`, task, { headers: H });
+    res.json({ ok:true, taskId: tr.data.id, linkedTo: whoId });
   } catch (e) {
     res.status(500).json({ ok:false, error: e.response?.data || e.message });
   }
 });
 
-// 2) Continue a session (send a message)
-app.post("/einstein/session/:sessionId/send", async (req, res) => {
-  try {
-    const tok = await getSfToken();
-    const host = process.env.BOT_RUNTIME_BASE_URL;
-    const botId = process.env.BOT_ID;
-    const { sessionId } = req.params;
-    const url = `${host}/v5/bots/${botId}/sessions/${sessionId}/messages`;
-
-    const payload = {
-      messages: [{
-        sequenceId: Date.now(), // simple monotonic id
-        text: req.body?.text || "How can you help me?"
-      }]
-    };
-
-    const { data } = await axios.post(url, payload, {
-      headers: {
-        Authorization: `Bearer ${tok.access_token}`,
-        "Content-Type": "application/json",
-        "X-Org-Id": process.env.ORG_ID,
-        "X-Request-Id": randomUUID()
-      }
-    });
-
-    res.json({ ok:true, response: data });
-  } catch (e) {
-    res.status(500).json({ ok:false, error: e.response?.data || e.message });
-  }
-});
 
 
 const port = process.env.PORT || 3000;
