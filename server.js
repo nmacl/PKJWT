@@ -63,6 +63,16 @@ app.post("/auth/sf/jwt/test", async (_, res) => {
   }
 });
 
+// ---------- Simple debug endpoint ----------
+app.post("/debug/klaviyo", (req, res) => {
+  console.log("🐛 DEBUG ENDPOINT HIT");
+  console.log("Headers:", JSON.stringify(req.headers, null, 2));
+  console.log("Body:", JSON.stringify(req.body, null, 2));
+  console.log("Raw body string:", req.body);
+  console.log("🐛 DEBUG END");
+  res.json({ ok: true, received: req.body });
+});
+
 // ---------- Main Klaviyo Webhook ----------
 app.post("/webhooks/klaviyo", async (req, res) => {
   const startTime = Date.now();
@@ -299,7 +309,7 @@ app.post("/webhooks/klaviyo", async (req, res) => {
 
   } catch (e) {
     const duration = Date.now() - startTime;
-    const orderId = req.body?.orderData?.OrderId || req.body?.orderData?.orderId || "unknown";
+    const orderId = req.body?.orderData?.OrderId || req.body?.orderData?.orderId || req.body?.debug_data?.event_orderId || "unknown";
     
     console.error(`❌ WEBHOOK FAILED: Order #${orderId} after ${duration}ms`);
     console.error(`   Error:`, e?.response?.data || e.message);
