@@ -89,12 +89,15 @@ app.post("/webhooks/klaviyo", async (req, res) => {
     const tok = await getSfToken();
     const H = { Authorization: `Bearer ${tok.access_token}` };
 
-    // find Contact then Lead by email (to link in timeline)
-    let personId = null;
+    // ... inside /webhooks/klaviyo
+
+    // find Contact then Lead; also grab AccountId and User Id to improve linking
+    let personId = null, accountId = null, fromUserId = null;
     if (toAddr) {
-      const qC = encodeURIComponent(`SELECT Id FROM Contact WHERE Email='${sq(toAddr)}' LIMIT 1`);
+      const qC = encodeURIComponent(`SELECT Id, AccountId FROM Contact WHERE Email='${sq(toAddr)}' LIMIT 1`);
       const rc = await axios.get(`${tok.instance_url}/services/data/${SF_API_VERSION}/query?q=${qC}`, { headers: H });
-      personId = rc.data?.records?.[0]?.Id || null;
+      personId  = rc.data?.records?.[0]?.Id || null;
+      accountId = rc.data?.records?.[0]?.AccountId || null;
 
       if (!personId) {
         const qL = encodeURIComponent(`SELECT Id FROM Lead WHERE Email='${sq(toAddr)}' LIMIT 1`);
@@ -103,28 +106,24 @@ app.post("/webhooks/klaviyo", async (req, res) => {
       }
     }
 
-    // Build readable HTML body
-    const htmlLines = [
-      `<p><strong>Order #${orderId}</strong></p>`,
-      req.body?.body ? `<p>${req.body.body}</p>` : "",
-      toAddr ? `<p><b>Email:</b> ${toAddr}</p>` : "",
-      phone ? `<p><b>Phone:</b> ${phone}</p>` : "",
-      (orderData?.FullName || orderData?.fullName) ? `<p><b>Customer:</b> ${orderData.FullName || orderData.fullName}</p>` : "",
-      (orderData?.value || orderData?.total) && (orderData?.value_currency || orderData?.currency)
-        ? `<p><b>Total:</b> ${orderData.total || orderData.value} ${orderData.currency || orderData.value_currency}</p>` : "",
-      `<pre>${JSON.stringify(orderData, null, 2)}</pre>`
-    ].filter(Boolean).join("");
+    // (optional) resolve the user who “sent” it
+    if (process.env.SF_USERNAME) {
+      const qU = encodeURIComponent(`SELECT Id FROM User WHERE Username='${sq(process.env.SF_USERNAME)}' LIMIT 1`);
+      const ru = await axios.get(`${tok.instance_url}/services/data/${SF_API_VERSION}/query?q=${qU}`, { headers: H });
+      fromUserId = ru.data?.records?.[0]?.Id || null;
+    }
 
-    // 1) Create EmailMessage (logs email)
+    // EmailMessage payload — set Status to Sent and RelatedToId to Account
     const emailMsgPayload = {
       Subject: subject,
       HtmlBody: htmlLines,
-      TextBody: htmlLines.replace(/<[^>]+>/g, ""), // simple strip
+      TextBody: htmlLines.replace(/<[^>]+>/g, ""),
       FromAddress: fromAddr,
       ToAddress: toAddr || "",
       Incoming: false,
-      MessageDate: new Date().toISOString()
-      // Optionally: RelatedToId if you want to tie to an Account/Case/etc.
+      Status: "Sent",                               // 👈 make it look like a real sent email
+      MessageDate: new Date().toISOString(),
+      ...(accountId ? { RelatedToId: accountId } : {}) // 👈 tie to Account like your “good” example
     };
 
     const emr = await axios.post(
@@ -134,22 +133,20 @@ app.post("/webhooks/klaviyo", async (req, res) => {
     );
     const emailMessageId = emr.data.id;
 
-    // 2) Link it to the Contact/Lead so it shows on their timeline
+    // Link recipients/sender so it shows on the Contact timeline
     if (personId) {
-      // Try ToAddress relation; if org disallows, fallback to RelatedTo
-      try {
-        await axios.post(
-          `${tok.instance_url}/services/data/${SF_API_VERSION}/sobjects/EmailMessageRelation`,
-          { EmailMessageId: emailMessageId, RelationId: personId, RelationType: "ToAddress" },
-          { headers: H }
-        );
-      } catch {
-        await axios.post(
-          `${tok.instance_url}/services/data/${SF_API_VERSION}/sobjects/EmailMessageRelation`,
-          { EmailMessageId: emailMessageId, RelationId: personId, RelationType: "RelatedTo" },
-          { headers: H }
-        );
-      }
+      await axios.post(
+        `${tok.instance_url}/services/data/${SF_API_VERSION}/sobjects/EmailMessageRelation`,
+        { EmailMessageId: emailMessageId, RelationId: personId, RelationType: "ToAddress" },
+        { headers: H }
+      );
+    }
+    if (fromUserId) {
+      await axios.post(
+        `${tok.instance_url}/services/data/${SF_API_VERSION}/sobjects/EmailMessageRelation`,
+        { EmailMessageId: emailMessageId, RelationId: fromUserId, RelationType: "FromAddress" },
+        { headers: H }
+      );
     }
 
     res.json({ ok:true, emailMessageId, linkedTo: personId, subject, to: toAddr });
