@@ -15,11 +15,6 @@ const getPrivateKey = () => {
   const k = process.env.SF_PRIVATE_KEY || "";
   return k.includes("\\n") ? k.replace(/\\n/g, "\n") : k;
 };
-const parseMaybeJson = v => {
-  if (!v) return null;
-  if (typeof v === "object") return v;
-  try { return JSON.parse(v); } catch { return null; }
-};
 
 function buildAssertion() {
   const now = Math.floor(Date.now() / 1000);
@@ -63,16 +58,6 @@ app.post("/auth/sf/jwt/test", async (_, res) => {
   }
 });
 
-// ---------- Simple debug endpoint ----------
-app.post("/debug/klaviyo", (req, res) => {
-  console.log("🐛 DEBUG ENDPOINT HIT");
-  console.log("Headers:", JSON.stringify(req.headers, null, 2));
-  console.log("Body:", JSON.stringify(req.body, null, 2));
-  console.log("Raw body string:", req.body);
-  console.log("🐛 DEBUG END");
-  res.json({ ok: true, received: req.body });
-});
-
 // ---------- Main Klaviyo Webhook ----------
 app.post("/webhooks/klaviyo", async (req, res) => {
   const startTime = Date.now();
@@ -87,16 +72,46 @@ app.post("/webhooks/klaviyo", async (req, res) => {
       }
     }
 
-    // ---- Extract inbound data ----
-    const email = req.body?.email || req.body?.orderData?.Email || req.body?.orderData?.email || null;
-    const orderData = parseMaybeJson(req.body?.orderData) || req.body?.orderData || {};
-    const orderId = orderData?.OrderId || orderData?.orderId || "N/A";
-    const phone = orderData?.Phone || orderData?.phone || "";
+    // ---- Parse the orderData string into an object ----
+    let orderData = {};
+    if (req.body?.orderData && typeof req.body.orderData === 'string') {
+      try {
+        // The orderData comes as a Python-style string, need to convert to valid JSON
+        const pythonStr = req.body.orderData;
+        // Convert Python dict syntax to JSON
+        const jsonStr = pythonStr
+          .replace(/'/g, '"')           // Single quotes to double quotes
+          .replace(/True/g, 'true')     // Python True to JSON true
+          .replace(/False/g, 'false')   // Python False to JSON false
+          .replace(/None/g, 'null');    // Python None to JSON null
+        
+        orderData = JSON.parse(jsonStr);
+      } catch (e) {
+        console.log("Failed to parse orderData:", e.message);
+        orderData = {};
+      }
+    } else if (req.body?.orderData && typeof req.body.orderData === 'object') {
+      orderData = req.body.orderData;
+    }
+
+    // ---- Extract data using correct structure ----
+    const email = req.body?.email || orderData?.BillingAddress?.Email || orderData?.ShippingAddress?.Email || null;
+    const orderId = orderData?.OrderId || "N/A";
+    
+    // Get customer info from BillingAddress (primary) or ShippingAddress (fallback)
+    const billing = orderData?.BillingAddress || {};
+    const shipping = orderData?.ShippingAddress || {};
+    
+    const fullName = billing?.FullName || shipping?.FullName || `${billing?.FirstName || ''} ${billing?.LastName || ''}`.trim() || "N/A";
+    const phone = billing?.Phone || shipping?.Phone || "";
+    
     const subject = req.body?.subject || `Order Confirmation: #${orderId}`;
-    const fromAddr = process.env.FROM_EMAIL || "klaviyo@parsonskellogg.com";
+    const fromAddr = process.env.FROM_EMAIL || "noreply@corporategear.email";
     const toAddr = email || "";
 
-    console.log(`🎯 WEBHOOK RECEIVED: Order #${orderId} for ${email} at ${new Date().toISOString()}`);
+    console.log(`🎯 WEBHOOK RECEIVED: Order #${orderId} for ${toAddr} at ${new Date().toISOString()}`);
+    console.log(`👤 Customer: ${fullName} (${phone || 'no phone'})`);
+    console.log(`💰 Total: $${orderData?.$value || 'unknown'} ${orderData?.$value_currency || 'USD'}`);
 
     // ---- Auth → Salesforce ----
     const tok = await getSfToken();
@@ -151,12 +166,12 @@ app.post("/webhooks/klaviyo", async (req, res) => {
     const addressSection = `
     <div style="margin-bottom: 20px; padding: 15px; border: 1px solid #ddd; border-radius: 5px;">
       <h3 style="color: #333; margin-top: 0;">Shipping Address</h3>
-      <p><strong>Address:</strong> ${orderData?.Address1 || ''}</p>
-      ${orderData?.Address2 ? `<p><strong>Address 2:</strong> ${orderData.Address2}</p>` : ''}
-      <p><strong>City:</strong> ${orderData?.City || ''}</p>
-      <p><strong>State/Region:</strong> ${orderData?.Region || ''}</p>
-      <p><strong>Zip Code:</strong> ${orderData?.Zip || ''}</p>
-      <p><strong>Country:</strong> ${orderData?.Country || ''}</p>
+      <p><strong>Address:</strong> ${shipping?.Address1 || billing?.Address1 || ''}</p>
+      ${(shipping?.Address2 || billing?.Address2) ? `<p><strong>Address 2:</strong> ${shipping.Address2 || billing.Address2}</p>` : ''}
+      <p><strong>City:</strong> ${shipping?.City || billing?.City || ''}</p>
+      <p><strong>State:</strong> ${shipping?.Region || billing?.Region || ''}</p>
+      <p><strong>Zip Code:</strong> ${shipping?.Zip || billing?.Zip || ''}</p>
+      <p><strong>Country:</strong> ${shipping?.Country || billing?.Country || ''}</p>
     </div>`;
 
     // Order Totals Section
@@ -164,41 +179,52 @@ app.post("/webhooks/klaviyo", async (req, res) => {
     <div style="margin-bottom: 20px; padding: 15px; border: 1px solid #ddd; border-radius: 5px;">
       <h3 style="color: #333; margin-top: 0;">Order Summary</h3>
       <table style="width: 100%; border-collapse: collapse;">
-        <tr><td style="padding: 5px 0; border-bottom: 1px solid #eee;"><strong>Subtotal:</strong></td><td style="text-align: right; padding: 5px 0; border-bottom: 1px solid #eee;">${formatCurrency(orderData?.SubTotal, orderData?.value_currency || orderData?.$value_currency)}</td></tr>
-        <tr><td style="padding: 5px 0; border-bottom: 1px solid #eee;"><strong>Shipping:</strong></td><td style="text-align: right; padding: 5px 0; border-bottom: 1px solid #eee;">${formatCurrency(orderData?.ShippingValue, orderData?.value_currency || orderData?.$value_currency)}</td></tr>
-        <tr><td style="padding: 5px 0; border-bottom: 1px solid #eee;"><strong>Tax:</strong></td><td style="text-align: right; padding: 5px 0; border-bottom: 1px solid #eee;">${formatCurrency(orderData?.Tax, orderData?.value_currency || orderData?.$value_currency)}</td></tr>
+        <tr><td style="padding: 5px 0; border-bottom: 1px solid #eee;"><strong>Subtotal:</strong></td><td style="text-align: right; padding: 5px 0; border-bottom: 1px solid #eee;">${formatCurrency(orderData?.SubTotal, orderData?.$value_currency)}</td></tr>
+        <tr><td style="padding: 5px 0; border-bottom: 1px solid #eee;"><strong>Shipping:</strong></td><td style="text-align: right; padding: 5px 0; border-bottom: 1px solid #eee;">${formatCurrency(orderData?.ShippingValue, orderData?.$value_currency)}</td></tr>
+        <tr><td style="padding: 5px 0; border-bottom: 1px solid #eee;"><strong>Tax:</strong></td><td style="text-align: right; padding: 5px 0; border-bottom: 1px solid #eee;">${formatCurrency(orderData?.Tax, orderData?.$value_currency)}</td></tr>
         ${orderData?.DiscountValue && parseFloat(orderData.DiscountValue) > 0 ? 
-          `<tr><td style="padding: 5px 0; border-bottom: 1px solid #eee;"><strong>Discount:</strong></td><td style="text-align: right; padding: 5px 0; border-bottom: 1px solid #eee;">-${formatCurrency(orderData.DiscountValue, orderData?.value_currency || orderData?.$value_currency)}</td></tr>` : ''}
-        <tr style="font-weight: bold; font-size: 1.1em;"><td style="padding: 10px 0; border-top: 2px solid #333;"><strong>Total:</strong></td><td style="text-align: right; padding: 10px 0; border-top: 2px solid #333;">${formatCurrency(orderData?.$value || orderData?.value, orderData?.value_currency || orderData?.$value_currency)}</td></tr>
+          `<tr><td style="padding: 5px 0; border-bottom: 1px solid #eee;"><strong>Discount:</strong></td><td style="text-align: right; padding: 5px 0; border-bottom: 1px solid #eee;">-${formatCurrency(orderData.DiscountValue, orderData?.$value_currency)}</td></tr>` : ''}
+        <tr style="font-weight: bold; font-size: 1.1em;"><td style="padding: 10px 0; border-top: 2px solid #333;"><strong>Total:</strong></td><td style="text-align: right; padding: 10px 0; border-top: 2px solid #333;">${formatCurrency(orderData?.$value, orderData?.$value_currency)}</td></tr>
       </table>
       <p><strong>Payment Method:</strong> ${orderData?.PaymentMethod || 'N/A'}</p>
+      <p><strong>Total Items:</strong> ${orderData?.TotalNumbersOfItemsOrdered || 'N/A'}</p>
       ${orderData?.DiscountCode ? `<p><strong>Discount Code:</strong> ${orderData.DiscountCode}</p>` : ''}
     </div>`;
 
-    // Product Details Section (if available)
-    const productSection = orderData?.ProductName ? `
-    <div style="margin-bottom: 20px; padding: 15px; border: 1px solid #ddd; border-radius: 5px;">
-      <h3 style="color: #333; margin-top: 0;">Product Details</h3>
-      <div style="border: 1px solid #eee; padding: 10px; margin-bottom: 10px;">
-        <p><strong>Product:</strong> ${orderData.ProductName}</p>
-        ${orderData.Brand ? `<p><strong>Brand:</strong> ${orderData.Brand}</p>` : ''}
-        ${orderData.SKU ? `<p><strong>SKU:</strong> ${orderData.SKU}</p>` : ''}
-        ${orderData.Color ? `<p><strong>Color:</strong> ${orderData.Color}</p>` : ''}
-        <p><strong>Quantity:</strong> ${orderData.Quantity || 'N/A'}</p>
-        <p><strong>Unit Price:</strong> ${formatCurrency(orderData?.ItemPrice, orderData?.value_currency || orderData?.$value_currency)}</p>
-        <p><strong>Line Total:</strong> ${formatCurrency(orderData?.RowTotal, orderData?.value_currency || orderData?.$value_currency)}</p>
-        ${orderData.ProductURL ? `<p><strong>Product Link:</strong> <a href="${orderData.ProductURL}">View Product</a></p>` : ''}
-        ${orderData.ImageURL ? `<p><strong>Product Image:</strong> <br><img src="${orderData.ImageURL}" style="max-width: 200px; height: auto;"></p>` : ''}
-      </div>
-    </div>` : '';
+    // Products Section - Build from Items array
+    let productsSection = '';
+    if (orderData?.Items && Array.isArray(orderData.Items) && orderData.Items.length > 0) {
+      const productRows = orderData.Items.map(item => `
+        <div style="border: 1px solid #eee; padding: 15px; margin-bottom: 10px; border-radius: 5px;">
+          <div style="display: flex; align-items: start; gap: 15px;">
+            ${item.ImageURL ? `<img src="${item.ImageURL}" style="width: 80px; height: 80px; object-fit: cover; border-radius: 3px;">` : ''}
+            <div style="flex: 1;">
+              <p><strong>${item.ProductName || 'Product'}</strong></p>
+              <p><strong>Brand:</strong> ${item.Brand || 'N/A'}</p>
+              <p><strong>SKU:</strong> ${item.SKU || 'N/A'}</p>
+              <p><strong>Color:</strong> ${item.Color || 'N/A'}</p>
+              <p><strong>Quantity:</strong> ${item.Quantity || 'N/A'}</p>
+              <p><strong>Unit Price:</strong> ${formatCurrency(item.ItemPrice, orderData?.$value_currency)}</p>
+              <p><strong>Line Total:</strong> ${formatCurrency(item.RowTotal, orderData?.$value_currency)}</p>
+              ${item.ProductURL ? `<p><a href="${item.ProductURL}" style="color: #007cba;">View Product</a></p>` : ''}
+              ${item.ItemNotes ? `<p><strong>Notes:</strong> ${item.ItemNotes}</p>` : ''}
+            </div>
+          </div>
+        </div>
+      `).join('');
+
+      productsSection = `
+      <div style="margin-bottom: 20px; padding: 15px; border: 1px solid #ddd; border-radius: 5px;">
+        <h3 style="color: #333; margin-top: 0;">Order Items (${orderData.Items.length})</h3>
+        ${productRows}
+      </div>`;
+    }
 
     // Notes Section
-    const notesSection = (orderData?.OrderNotes || orderData?.ItemNotes) ? `
+    const notesSection = orderData?.OrderNotes ? `
     <div style="margin-bottom: 20px; padding: 15px; border: 1px solid #ddd; border-radius: 5px;">
-      <h3 style="color: #333; margin-top: 0;">Notes</h3>
-      ${orderData?.OrderNotes ? `<p><strong>Order Notes:</strong> ${orderData.OrderNotes}</p>` : ''}
-      ${orderData?.ItemNotes ? `<p><strong>Item Notes:</strong> ${orderData.ItemNotes}</p>` : ''}
-      ${orderData?.LogoNotes ? `<p><strong>Logo Notes:</strong> ${orderData.LogoNotes}</p>` : ''}
+      <h3 style="color: #333; margin-top: 0;">Order Notes</h3>
+      <p>${orderData.OrderNotes}</p>
     </div>` : '';
 
     // Custom message from Klaviyo (if any)
@@ -223,7 +249,7 @@ app.post("/webhooks/klaviyo", async (req, res) => {
       ${customerSection}
       ${addressSection}
       ${totalsSection}
-      ${productSection}
+      ${productsSection}
       ${notesSection}
       ${rawDataSection}
     </div>`;
@@ -304,15 +330,16 @@ app.post("/webhooks/klaviyo", async (req, res) => {
       linkedPersonId: personId,
       relatedToAccountId: accountId || null,
       subject,
-      to: toAddr
+      to: toAddr,
+      orderTotal: orderData?.$value,
+      itemCount: orderData?.TotalNumbersOfItemsOrdered
     });
 
   } catch (e) {
     const duration = Date.now() - startTime;
-    const orderId = req.body?.orderData?.OrderId || req.body?.orderData?.orderId || req.body?.debug_data?.event_orderId || "unknown";
-    
-    console.error(`❌ WEBHOOK FAILED: Order #${orderId} after ${duration}ms`);
+    console.error(`❌ WEBHOOK FAILED after ${duration}ms`);
     console.error(`   Error:`, e?.response?.data || e.message);
+    console.error(`   Stack:`, e.stack);
     
     res.status(500).json({ ok: false, error: e.response?.data || e.message });
   }
