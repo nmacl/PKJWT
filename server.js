@@ -20,6 +20,7 @@ const parseMaybeJson = v => {
   if (typeof v === "object") return v;
   try { return JSON.parse(v); } catch { return null; }
 };
+
 function buildAssertion() {
   const now = Math.floor(Date.now() / 1000);
   const payload = {
@@ -30,6 +31,7 @@ function buildAssertion() {
   };
   return jwt.sign(payload, getPrivateKey(), { algorithm: "RS256" });
 }
+
 async function getSfToken() {
   const url = `${getLoginUrl()}/services/oauth2/token`;
   const body = new URLSearchParams();
@@ -61,37 +63,36 @@ app.post("/auth/sf/jwt/test", async (_, res) => {
   }
 });
 
-// --- constants & helpers above stay the same ---
-
+// ---------- Main Klaviyo Webhook ----------
 app.post("/webhooks/klaviyo", async (req, res) => {
+  const startTime = Date.now();
+  
   try {
     // OPTIONAL shared-secret check
     if (process.env.KLAVIYO_SECRET) {
       const sig = req.headers["x-klaviyo-signature"];
       if (sig !== process.env.KLAVIYO_SECRET) {
+        console.log(`❌ UNAUTHORIZED: Invalid signature`);
         return res.status(401).json({ ok: false, error: "unauthorized" });
       }
     }
 
-    // ---- Extract inbound data (supports orderData as object or JSON string) ----
-    const email =
-      req.body?.email ||
-      req.body?.orderData?.Email ||
-      req.body?.orderData?.email || null;
-
+    // ---- Extract inbound data ----
+    const email = req.body?.email || req.body?.orderData?.Email || req.body?.orderData?.email || null;
     const orderData = parseMaybeJson(req.body?.orderData) || req.body?.orderData || {};
-    const orderId   = orderData?.OrderId || orderData?.orderId || "N/A";
-    const phone     = orderData?.Phone   || orderData?.phone   || "";
-
-    const subject  = req.body?.subject || `Order: #${orderId}`;
+    const orderId = orderData?.OrderId || orderData?.orderId || "N/A";
+    const phone = orderData?.Phone || orderData?.phone || "";
+    const subject = req.body?.subject || `Order Confirmation: #${orderId}`;
     const fromAddr = process.env.FROM_EMAIL || "klaviyo@parsonskellogg.com";
-    const toAddr   = email || "";
+    const toAddr = email || "";
+
+    console.log(`🎯 WEBHOOK RECEIVED: Order #${orderId} for ${email} at ${new Date().toISOString()}`);
 
     // ---- Auth → Salesforce ----
     const tok = await getSfToken();
     const H = { Authorization: `Bearer ${tok.access_token}` };
 
-    // ---- Resolve Contact/Lead + Account and From User (for nice linking) ----
+    // ---- Resolve Contact/Lead + Account and From User ----
     let personId = null;   // Contact.Id or Lead.Id
     let accountId = null;  // Contact.AccountId (if Contact)
     let fromUserId = null; // User.Id for your integration user
@@ -100,7 +101,7 @@ app.post("/webhooks/klaviyo", async (req, res) => {
       // Try Contact first (grab AccountId for RelatedToId)
       const qC = encodeURIComponent(`SELECT Id, AccountId FROM Contact WHERE Email='${sq(toAddr)}' LIMIT 1`);
       const rc = await axios.get(`${tok.instance_url}/services/data/${SF_API_VERSION}/query?q=${qC}`, { headers: H });
-      personId  = rc.data?.records?.[0]?.Id || null;
+      personId = rc.data?.records?.[0]?.Id || null;
       accountId = rc.data?.records?.[0]?.AccountId || null;
 
       // Fall back to Lead
@@ -111,29 +112,118 @@ app.post("/webhooks/klaviyo", async (req, res) => {
       }
     }
 
-    // Resolve sender user (optional but nice: shows “From” user)
+    // Resolve sender user (optional but nice: shows "From" user)
     if (process.env.SF_USERNAME) {
       const qU = encodeURIComponent(`SELECT Id FROM User WHERE Username='${sq(process.env.SF_USERNAME)}' LIMIT 1`);
       const ru = await axios.get(`${tok.instance_url}/services/data/${SF_API_VERSION}/query?q=${qU}`, { headers: H });
       fromUserId = ru.data?.records?.[0]?.Id || null;
     }
 
-    // ---- Build bodies (HTML + Text) ----
-    const htmlLines = [
-      `<p><strong>Order #${orderId}</strong></p>`,
-      req.body?.body ? `<p>${req.body.body}</p>` : "",
-      toAddr ? `<p><b>Email:</b> ${toAddr}</p>` : "",
-      phone ? `<p><b>Phone:</b> ${phone}</p>` : "",
-      (orderData?.FullName || orderData?.fullName) ? `<p><b>Customer:</b> ${orderData.FullName || orderData.fullName}</p>` : "",
-      (orderData?.value || orderData?.total) && (orderData?.value_currency || orderData?.currency)
-        ? `<p><b>Total:</b> ${orderData.total || orderData.value} ${orderData.currency || orderData.value_currency}</p>` : "",
-      `<pre>${JSON.stringify(orderData, null, 2)}</pre>`
-    ].filter(Boolean).join("");
+    // ---- Build comprehensive email content ----
+    const formatCurrency = (amount, currency = 'USD') => {
+      if (!amount) return '';
+      const num = parseFloat(amount);
+      return isNaN(num) ? amount : `$${num.toFixed(2)} ${currency}`;
+    };
 
+    // Customer Information Section
+    const customerSection = `
+    <div style="margin-bottom: 20px; padding: 15px; border: 1px solid #ddd; border-radius: 5px;">
+      <h3 style="color: #333; margin-top: 0;">Customer Information</h3>
+      <p><strong>Name:</strong> ${orderData?.FullName || 'N/A'}</p>
+      <p><strong>Email:</strong> ${toAddr}</p>
+      <p><strong>Phone:</strong> ${phone || 'N/A'}</p>
+      <p><strong>Order ID:</strong> ${orderId}</p>
+      ${orderData?.OrderDetailsLink ? `<p><strong>Order Details:</strong> <a href="${orderData.OrderDetailsLink}">View Full Order</a></p>` : ''}
+    </div>`;
+
+    // Billing & Shipping Section
+    const addressSection = `
+    <div style="margin-bottom: 20px; padding: 15px; border: 1px solid #ddd; border-radius: 5px;">
+      <h3 style="color: #333; margin-top: 0;">Shipping Address</h3>
+      <p><strong>Address:</strong> ${orderData?.Address1 || ''}</p>
+      ${orderData?.Address2 ? `<p><strong>Address 2:</strong> ${orderData.Address2}</p>` : ''}
+      <p><strong>City:</strong> ${orderData?.City || ''}</p>
+      <p><strong>State/Region:</strong> ${orderData?.Region || ''}</p>
+      <p><strong>Zip Code:</strong> ${orderData?.Zip || ''}</p>
+      <p><strong>Country:</strong> ${orderData?.Country || ''}</p>
+    </div>`;
+
+    // Order Totals Section
+    const totalsSection = `
+    <div style="margin-bottom: 20px; padding: 15px; border: 1px solid #ddd; border-radius: 5px;">
+      <h3 style="color: #333; margin-top: 0;">Order Summary</h3>
+      <table style="width: 100%; border-collapse: collapse;">
+        <tr><td style="padding: 5px 0; border-bottom: 1px solid #eee;"><strong>Subtotal:</strong></td><td style="text-align: right; padding: 5px 0; border-bottom: 1px solid #eee;">${formatCurrency(orderData?.SubTotal, orderData?.value_currency || orderData?.$value_currency)}</td></tr>
+        <tr><td style="padding: 5px 0; border-bottom: 1px solid #eee;"><strong>Shipping:</strong></td><td style="text-align: right; padding: 5px 0; border-bottom: 1px solid #eee;">${formatCurrency(orderData?.ShippingValue, orderData?.value_currency || orderData?.$value_currency)}</td></tr>
+        <tr><td style="padding: 5px 0; border-bottom: 1px solid #eee;"><strong>Tax:</strong></td><td style="text-align: right; padding: 5px 0; border-bottom: 1px solid #eee;">${formatCurrency(orderData?.Tax, orderData?.value_currency || orderData?.$value_currency)}</td></tr>
+        ${orderData?.DiscountValue && parseFloat(orderData.DiscountValue) > 0 ? 
+          `<tr><td style="padding: 5px 0; border-bottom: 1px solid #eee;"><strong>Discount:</strong></td><td style="text-align: right; padding: 5px 0; border-bottom: 1px solid #eee;">-${formatCurrency(orderData.DiscountValue, orderData?.value_currency || orderData?.$value_currency)}</td></tr>` : ''}
+        <tr style="font-weight: bold; font-size: 1.1em;"><td style="padding: 10px 0; border-top: 2px solid #333;"><strong>Total:</strong></td><td style="text-align: right; padding: 10px 0; border-top: 2px solid #333;">${formatCurrency(orderData?.$value || orderData?.value, orderData?.value_currency || orderData?.$value_currency)}</td></tr>
+      </table>
+      <p><strong>Payment Method:</strong> ${orderData?.PaymentMethod || 'N/A'}</p>
+      ${orderData?.DiscountCode ? `<p><strong>Discount Code:</strong> ${orderData.DiscountCode}</p>` : ''}
+    </div>`;
+
+    // Product Details Section (if available)
+    const productSection = orderData?.ProductName ? `
+    <div style="margin-bottom: 20px; padding: 15px; border: 1px solid #ddd; border-radius: 5px;">
+      <h3 style="color: #333; margin-top: 0;">Product Details</h3>
+      <div style="border: 1px solid #eee; padding: 10px; margin-bottom: 10px;">
+        <p><strong>Product:</strong> ${orderData.ProductName}</p>
+        ${orderData.Brand ? `<p><strong>Brand:</strong> ${orderData.Brand}</p>` : ''}
+        ${orderData.SKU ? `<p><strong>SKU:</strong> ${orderData.SKU}</p>` : ''}
+        ${orderData.Color ? `<p><strong>Color:</strong> ${orderData.Color}</p>` : ''}
+        <p><strong>Quantity:</strong> ${orderData.Quantity || 'N/A'}</p>
+        <p><strong>Unit Price:</strong> ${formatCurrency(orderData?.ItemPrice, orderData?.value_currency || orderData?.$value_currency)}</p>
+        <p><strong>Line Total:</strong> ${formatCurrency(orderData?.RowTotal, orderData?.value_currency || orderData?.$value_currency)}</p>
+        ${orderData.ProductURL ? `<p><strong>Product Link:</strong> <a href="${orderData.ProductURL}">View Product</a></p>` : ''}
+        ${orderData.ImageURL ? `<p><strong>Product Image:</strong> <br><img src="${orderData.ImageURL}" style="max-width: 200px; height: auto;"></p>` : ''}
+      </div>
+    </div>` : '';
+
+    // Notes Section
+    const notesSection = (orderData?.OrderNotes || orderData?.ItemNotes) ? `
+    <div style="margin-bottom: 20px; padding: 15px; border: 1px solid #ddd; border-radius: 5px;">
+      <h3 style="color: #333; margin-top: 0;">Notes</h3>
+      ${orderData?.OrderNotes ? `<p><strong>Order Notes:</strong> ${orderData.OrderNotes}</p>` : ''}
+      ${orderData?.ItemNotes ? `<p><strong>Item Notes:</strong> ${orderData.ItemNotes}</p>` : ''}
+      ${orderData?.LogoNotes ? `<p><strong>Logo Notes:</strong> ${orderData.LogoNotes}</p>` : ''}
+    </div>` : '';
+
+    // Custom message from Klaviyo (if any)
+    const customMessage = req.body?.body ? `
+    <div style="margin-bottom: 20px; padding: 15px; background-color: #f9f9f9; border-radius: 5px;">
+      <h3 style="color: #333; margin-top: 0;">Message</h3>
+      <p>${req.body.body}</p>
+    </div>` : '';
+
+    // Raw Data Section (for debugging/completeness)
+    const rawDataSection = `
+    <div style="margin-top: 30px; padding: 15px; background-color: #f5f5f5; border-radius: 5px;">
+      <h4 style="color: #666; margin-top: 0;">Complete Order Data</h4>
+      <pre style="background: white; padding: 10px; border-radius: 3px; overflow-x: auto; font-size: 11px;">${JSON.stringify(orderData, null, 2)}</pre>
+    </div>`;
+
+    // Combine all sections
+    const htmlLines = `
+    <div style="font-family: Arial, sans-serif; max-width: 800px;">
+      <h2 style="color: #333; border-bottom: 2px solid #007cba; padding-bottom: 10px;">Order Confirmation: #${orderId}</h2>
+      ${customMessage}
+      ${customerSection}
+      ${addressSection}
+      ${totalsSection}
+      ${productSection}
+      ${notesSection}
+      ${rawDataSection}
+    </div>`;
+
+    // Create plain text version
     const textBody = htmlLines
       .replace(/<\/p>/gi, "\n")
+      .replace(/<\/div>/gi, "\n")
       .replace(/<br\s*\/?>/gi, "\n")
-      .replace(/<[^>]+>/g, "") // naive strip
+      .replace(/<[^>]+>/g, "")
       .replace(/\n{3,}/g, "\n\n")
       .trim();
 
@@ -145,9 +235,9 @@ app.post("/webhooks/klaviyo", async (req, res) => {
       FromAddress: fromAddr,
       ToAddress: toAddr,
       Incoming: false,
-      Status: 3,                       // <-- this makes it look like a real sent email
+      Status: "3",                          // <-- "Sent" status (numeric value)
       MessageDate: new Date().toISOString(),
-      ...(accountId ? { RelatedToId: accountId } : {}) // <-- shows on Account like your “good” example
+      ...(accountId ? { RelatedToId: accountId } : {}) // <-- shows on Account
     };
 
     const emr = await axios.post(
@@ -191,7 +281,13 @@ app.post("/webhooks/klaviyo", async (req, res) => {
       }
     }
 
-    // ---- Done ----
+    // ---- Success Logging ----
+    const duration = Date.now() - startTime;
+    console.log(`✅ SUCCESS: Order #${orderId} logged to Salesforce in ${duration}ms`);
+    console.log(`   📧 EmailMessage ID: ${emailMessageId}`);
+    console.log(`   👤 Person ID: ${personId || 'none'}`);
+    console.log(`   🏢 Account ID: ${accountId || 'none'}`);
+
     res.json({
       ok: true,
       emailMessageId,
@@ -200,12 +296,17 @@ app.post("/webhooks/klaviyo", async (req, res) => {
       subject,
       to: toAddr
     });
+
   } catch (e) {
-    console.error("Email log error:", e?.response?.data || e);
+    const duration = Date.now() - startTime;
+    const orderId = req.body?.orderData?.OrderId || req.body?.orderData?.orderId || "unknown";
+    
+    console.error(`❌ WEBHOOK FAILED: Order #${orderId} after ${duration}ms`);
+    console.error(`   Error:`, e?.response?.data || e.message);
+    
     res.status(500).json({ ok: false, error: e.response?.data || e.message });
   }
 });
-
 
 // ---------- Start ----------
 const port = process.env.PORT || 3000;
