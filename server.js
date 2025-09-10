@@ -137,8 +137,6 @@ app.post("/webhooks/klaviyo", async (req, res) => {
       Status: "Completed",
       Priority: "Normal",
       ActivityDate: new Date().toISOString().slice(0,10), // YYYY-MM-DD (today)
-      Email: email || undefined,
-      Phone: phone || undefined,
       ...(whoId ? { WhoId: whoId } : {})
     };
 
