@@ -65,40 +65,45 @@ app.post("/auth/sf/jwt/test", async (_, res) => {
 
 app.post("/webhooks/klaviyo", async (req, res) => {
   try {
+    // OPTIONAL shared-secret check
     if (process.env.KLAVIYO_SECRET) {
       const sig = req.headers["x-klaviyo-signature"];
-      if (sig !== process.env.KLAVIYO_SECRET) return res.status(401).json({ ok:false, error:"unauthorized" });
+      if (sig !== process.env.KLAVIYO_SECRET) {
+        return res.status(401).json({ ok: false, error: "unauthorized" });
+      }
     }
 
+    // ---- Extract inbound data (supports orderData as object or JSON string) ----
     const email =
       req.body?.email ||
       req.body?.orderData?.Email ||
       req.body?.orderData?.email || null;
 
-    const orderData = (typeof req.body?.orderData === "string"
-      ? JSON.parse(req.body.orderData)
-      : (req.body?.orderData || {}));
+    const orderData = parseMaybeJson(req.body?.orderData) || req.body?.orderData || {};
+    const orderId   = orderData?.OrderId || orderData?.orderId || "N/A";
+    const phone     = orderData?.Phone   || orderData?.phone   || "";
 
-    const orderId = orderData?.OrderId || orderData?.orderId || "N/A";
-    const phone   = orderData?.Phone || orderData?.phone || "";
-
-    const subject = req.body?.subject || `Order: #${orderId}`;
+    const subject  = req.body?.subject || `Order: #${orderId}`;
     const fromAddr = process.env.FROM_EMAIL || "klaviyo@parsonskellogg.com";
-    const toAddr = email;
+    const toAddr   = email || "";
 
+    // ---- Auth → Salesforce ----
     const tok = await getSfToken();
     const H = { Authorization: `Bearer ${tok.access_token}` };
 
-    // ... inside /webhooks/klaviyo
+    // ---- Resolve Contact/Lead + Account and From User (for nice linking) ----
+    let personId = null;   // Contact.Id or Lead.Id
+    let accountId = null;  // Contact.AccountId (if Contact)
+    let fromUserId = null; // User.Id for your integration user
 
-    // find Contact then Lead; also grab AccountId and User Id to improve linking
-    let personId = null, accountId = null, fromUserId = null;
     if (toAddr) {
+      // Try Contact first (grab AccountId for RelatedToId)
       const qC = encodeURIComponent(`SELECT Id, AccountId FROM Contact WHERE Email='${sq(toAddr)}' LIMIT 1`);
       const rc = await axios.get(`${tok.instance_url}/services/data/${SF_API_VERSION}/query?q=${qC}`, { headers: H });
       personId  = rc.data?.records?.[0]?.Id || null;
       accountId = rc.data?.records?.[0]?.AccountId || null;
 
+      // Fall back to Lead
       if (!personId) {
         const qL = encodeURIComponent(`SELECT Id FROM Lead WHERE Email='${sq(toAddr)}' LIMIT 1`);
         const rl = await axios.get(`${tok.instance_url}/services/data/${SF_API_VERSION}/query?q=${qL}`, { headers: H });
@@ -106,24 +111,43 @@ app.post("/webhooks/klaviyo", async (req, res) => {
       }
     }
 
-    // (optional) resolve the user who “sent” it
+    // Resolve sender user (optional but nice: shows “From” user)
     if (process.env.SF_USERNAME) {
       const qU = encodeURIComponent(`SELECT Id FROM User WHERE Username='${sq(process.env.SF_USERNAME)}' LIMIT 1`);
       const ru = await axios.get(`${tok.instance_url}/services/data/${SF_API_VERSION}/query?q=${qU}`, { headers: H });
       fromUserId = ru.data?.records?.[0]?.Id || null;
     }
 
-    // EmailMessage payload — set Status to Sent and RelatedToId to Account
+    // ---- Build bodies (HTML + Text) ----
+    const htmlLines = [
+      `<p><strong>Order #${orderId}</strong></p>`,
+      req.body?.body ? `<p>${req.body.body}</p>` : "",
+      toAddr ? `<p><b>Email:</b> ${toAddr}</p>` : "",
+      phone ? `<p><b>Phone:</b> ${phone}</p>` : "",
+      (orderData?.FullName || orderData?.fullName) ? `<p><b>Customer:</b> ${orderData.FullName || orderData.fullName}</p>` : "",
+      (orderData?.value || orderData?.total) && (orderData?.value_currency || orderData?.currency)
+        ? `<p><b>Total:</b> ${orderData.total || orderData.value} ${orderData.currency || orderData.value_currency}</p>` : "",
+      `<pre>${JSON.stringify(orderData, null, 2)}</pre>`
+    ].filter(Boolean).join("");
+
+    const textBody = htmlLines
+      .replace(/<\/p>/gi, "\n")
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<[^>]+>/g, "") // naive strip
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+
+    // ---- 1) Create EmailMessage (as Sent, link to Account if we have it) ----
     const emailMsgPayload = {
       Subject: subject,
       HtmlBody: htmlLines,
-      TextBody: htmlLines.replace(/<[^>]+>/g, ""),
+      TextBody: textBody,
       FromAddress: fromAddr,
-      ToAddress: toAddr || "",
+      ToAddress: toAddr,
       Incoming: false,
-      Status: "Sent",                               // 👈 make it look like a real sent email
+      Status: "Sent",                       // <-- this makes it look like a real sent email
       MessageDate: new Date().toISOString(),
-      ...(accountId ? { RelatedToId: accountId } : {}) // 👈 tie to Account like your “good” example
+      ...(accountId ? { RelatedToId: accountId } : {}) // <-- shows on Account like your “good” example
     };
 
     const emr = await axios.post(
@@ -133,26 +157,52 @@ app.post("/webhooks/klaviyo", async (req, res) => {
     );
     const emailMessageId = emr.data.id;
 
-    // Link recipients/sender so it shows on the Contact timeline
+    // ---- 2) Link recipients/sender via EmailMessageRelation so it shows on Contact/Lead ----
+    const relEndpoint = `${tok.instance_url}/services/data/${SF_API_VERSION}/sobjects/EmailMessageRelation`;
+
+    // Tie to Contact/Lead as recipient
     if (personId) {
-      await axios.post(
-        `${tok.instance_url}/services/data/${SF_API_VERSION}/sobjects/EmailMessageRelation`,
-        { EmailMessageId: emailMessageId, RelationId: personId, RelationType: "ToAddress" },
-        { headers: H }
-      );
-    }
-    if (fromUserId) {
-      await axios.post(
-        `${tok.instance_url}/services/data/${SF_API_VERSION}/sobjects/EmailMessageRelation`,
-        { EmailMessageId: emailMessageId, RelationId: fromUserId, RelationType: "FromAddress" },
-        { headers: H }
-      );
+      try {
+        await axios.post(relEndpoint, {
+          EmailMessageId: emailMessageId,
+          RelationId: personId,
+          RelationType: "ToAddress"
+        }, { headers: H });
+      } catch {
+        // Fallback if org restricts RelationType
+        await axios.post(relEndpoint, {
+          EmailMessageId: emailMessageId,
+          RelationId: personId,
+          RelationType: "RelatedTo"
+        }, { headers: H });
+      }
     }
 
-    res.json({ ok:true, emailMessageId, linkedTo: personId, subject, to: toAddr });
+    // Tie the sender user (optional)
+    if (fromUserId) {
+      try {
+        await axios.post(relEndpoint, {
+          EmailMessageId: emailMessageId,
+          RelationId: fromUserId,
+          RelationType: "FromAddress"
+        }, { headers: H });
+      } catch {
+        // ignore if not allowed
+      }
+    }
+
+    // ---- Done ----
+    res.json({
+      ok: true,
+      emailMessageId,
+      linkedPersonId: personId,
+      relatedToAccountId: accountId || null,
+      subject,
+      to: toAddr
+    });
   } catch (e) {
     console.error("Email log error:", e?.response?.data || e);
-    res.status(500).json({ ok:false, error: e.response?.data || e.message });
+    res.status(500).json({ ok: false, error: e.response?.data || e.message });
   }
 });
 
