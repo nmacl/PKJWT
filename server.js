@@ -145,7 +145,7 @@ app.post("/webhooks/klaviyo", async (req, res) => {
       FromAddress: fromAddr,
       ToAddress: toAddr,
       Incoming: false,
-      Status: "Sent",                       // <-- this makes it look like a real sent email
+      Status: 3,                       // <-- this makes it look like a real sent email
       MessageDate: new Date().toISOString(),
       ...(accountId ? { RelatedToId: accountId } : {}) // <-- shows on Account like your “good” example
     };
