@@ -130,7 +130,7 @@ app.post("/webhooks/klaviyo", async (req, res) => {
     const customerSection = `
     <div style="margin-bottom: 20px; padding: 15px; border: 1px solid #ddd; border-radius: 5px;">
       <h3 style="color: #333; margin-top: 0;">Customer Information</h3>
-      <p><strong>Name:</strong> ${orderData?.FullName || 'N/A'}</p>
+      <p><strong>Name:</strong> ${fullName}</p>
       <p><strong>Email:</strong> ${toAddr}</p>
       <p><strong>Phone:</strong> ${phone || 'N/A'}</p>
       <p><strong>Order ID:</strong> ${orderId}</p>
