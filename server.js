@@ -7,7 +7,6 @@ require("dotenv").config();
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-// ---------- Helpers ----------
 const SF_API_VERSION = process.env.SF_API_VERSION || "v61.0";
 const sq = s => String(s ?? "").replace(/'/g, "\\'");
 const getLoginUrl = () => (process.env.SF_LOGIN_URL || "https://login.salesforce.com").replace(/\/+$/,"");
@@ -19,9 +18,9 @@ const getPrivateKey = () => {
 function buildAssertion() {
   const now = Math.floor(Date.now() / 1000);
   const payload = {
-    iss: process.env.SF_CONSUMER_KEY,   // Connected App consumer key
-    sub: process.env.SF_USERNAME,       // Salesforce username to impersonate
-    aud: getLoginUrl(),                 // must match token host
+    iss: process.env.SF_CONSUMER_KEY, 
+    sub: process.env.SF_USERNAME,
+    aud: getLoginUrl(),
     exp: now + 180
   };
   return jwt.sign(payload, getPrivateKey(), { algorithm: "RS256" });
@@ -39,10 +38,8 @@ async function getSfToken() {
   return data; // { access_token, instance_url, scope, token_type }
 }
 
-// ---------- Health ----------
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// ---------- JWT smoke test ----------
 app.post("/auth/sf/jwt/test", async (_, res) => {
   try {
     const tok = await getSfToken();
@@ -63,7 +60,6 @@ app.post("/webhooks/klaviyo", async (req, res) => {
   const startTime = Date.now();
   
   try {
-    // OPTIONAL shared-secret check
     if (process.env.KLAVIYO_SECRET) {
       const sig = req.headers["x-klaviyo-signature"];
       if (sig !== process.env.KLAVIYO_SECRET) {
@@ -72,11 +68,9 @@ app.post("/webhooks/klaviyo", async (req, res) => {
       }
     }
 
-    // ---- Parse the orderData string into an object ----
     let orderData = {};
     if (req.body?.orderData && typeof req.body.orderData === 'string') {
       try {
-        // The orderData comes as a Python-style string, need to convert to valid JSON
         const pythonStr = req.body.orderData;
         // Convert Python dict syntax to JSON
         const jsonStr = pythonStr
@@ -94,11 +88,9 @@ app.post("/webhooks/klaviyo", async (req, res) => {
       orderData = req.body.orderData;
     }
 
-    // ---- Extract data using correct structure ----
     const email = req.body?.email || orderData?.BillingAddress?.Email || orderData?.ShippingAddress?.Email || null;
     const orderId = orderData?.OrderId || "N/A";
     
-    // Get customer info from BillingAddress (primary) or ShippingAddress (fallback)
     const billing = orderData?.BillingAddress || {};
     const shipping = orderData?.ShippingAddress || {};
     
@@ -117,7 +109,6 @@ app.post("/webhooks/klaviyo", async (req, res) => {
     const tok = await getSfToken();
     const H = { Authorization: `Bearer ${tok.access_token}` };
 
-    // ---- Resolve Contact/Lead + Account and From User ----
     let personId = null;   // Contact.Id or Lead.Id
     let accountId = null;  // Contact.AccountId (if Contact)
     let fromUserId = null; // User.Id for your integration user
@@ -137,21 +128,18 @@ app.post("/webhooks/klaviyo", async (req, res) => {
       }
     }
 
-    // Resolve sender user (optional but nice: shows "From" user)
     if (process.env.SF_USERNAME) {
       const qU = encodeURIComponent(`SELECT Id FROM User WHERE Username='${sq(process.env.SF_USERNAME)}' LIMIT 1`);
       const ru = await axios.get(`${tok.instance_url}/services/data/${SF_API_VERSION}/query?q=${qU}`, { headers: H });
       fromUserId = ru.data?.records?.[0]?.Id || null;
     }
 
-    // ---- Build comprehensive email content ----
     const formatCurrency = (amount, currency = 'USD') => {
       if (!amount) return '';
       const num = parseFloat(amount);
       return isNaN(num) ? amount : `$${num.toFixed(2)} ${currency}`;
     };
 
-    // Customer Information Section
     const customerSection = `
     <div style="margin-bottom: 20px; padding: 15px; border: 1px solid #ddd; border-radius: 5px;">
       <h3 style="color: #333; margin-top: 0;">Customer Information</h3>
@@ -162,7 +150,6 @@ app.post("/webhooks/klaviyo", async (req, res) => {
       ${orderData?.OrderDetailsLink ? `<p><strong>Order Details:</strong> <a href="${orderData.OrderDetailsLink}">View Full Order</a></p>` : ''}
     </div>`;
 
-    // Billing & Shipping Section
     const addressSection = `
     <div style="margin-bottom: 20px; padding: 15px; border: 1px solid #ddd; border-radius: 5px;">
       <h3 style="color: #333; margin-top: 0;">Shipping Address</h3>
@@ -283,7 +270,6 @@ app.post("/webhooks/klaviyo", async (req, res) => {
     );
     const emailMessageId = emr.data.id;
 
-    // ---- 2) Link recipients/sender via EmailMessageRelation so it shows on Contact/Lead ----
     const relEndpoint = `${tok.instance_url}/services/data/${SF_API_VERSION}/sobjects/EmailMessageRelation`;
 
     // Tie to Contact/Lead as recipient
@@ -317,7 +303,6 @@ app.post("/webhooks/klaviyo", async (req, res) => {
       }
     }
 
-    // ---- Success Logging ----
     const duration = Date.now() - startTime;
     console.log(`✅ SUCCESS: Order #${orderId} logged to Salesforce in ${duration}ms`);
     console.log(`   📧 EmailMessage ID: ${emailMessageId}`);
@@ -345,6 +330,170 @@ app.post("/webhooks/klaviyo", async (req, res) => {
   }
 });
 
-// ---------- Start ----------
+app.post("/webhooks/salesforce", async (req, res) => {
+  const startTime = Date.now();
+  
+  try {
+    // OPTIONAL shared-secret check
+    if (process.env.KLAVIYO_SECRET) {
+      const sig = req.headers["x-webhook-signature"];
+      if (sig !== process.env.KLAVIYO_SECRET) {
+        console.log(`❌ UNAUTHORIZED: Invalid webhook signature`);
+        return res.status(401).json({ ok: false, error: "unauthorized" });
+      }
+    }
+
+    const leadData = req.body?.lead;
+    if (!leadData) {
+      return res.status(400).json({ ok: false, error: "Missing 'lead' object in request body" });
+    }
+
+    // Validate required fields
+    const required = ['firstName', 'lastName', 'company', 'email'];
+    const missing = required.filter(field => !leadData[field]);
+    if (missing.length > 0) {
+      return res.status(400).json({ 
+        ok: false, 
+        error: `Missing required fields: ${missing.join(', ')}` 
+      });
+    }
+
+    console.log(`🎯 LEAD WEBHOOK: ${leadData.firstName} ${leadData.lastName} (${leadData.email}) at ${new Date().toISOString()}`);
+    console.log(`🏢 Company: ${leadData.company}`);
+    console.log(`📱 Source: ${leadData.leadSource || 'Not specified'}`);
+
+    const tok = await getSfToken();
+    const H = { Authorization: `Bearer ${tok.access_token}` };
+
+    let existingRecord = null;
+    
+    // Check for existing Contact first
+    const qC = encodeURIComponent(`SELECT Id, Email FROM Contact WHERE Email='${sq(leadData.email)}' LIMIT 1`);
+    const rc = await axios.get(`${tok.instance_url}/services/data/${SF_API_VERSION}/query?q=${qC}`, { headers: H });
+    if (rc.data?.records?.[0]) {
+      existingRecord = { type: 'Contact', id: rc.data.records[0].Id };
+    }
+
+    // Check for existing Lead if no Contact found
+    if (!existingRecord) {
+      const qL = encodeURIComponent(`SELECT Id, Email FROM Lead WHERE Email='${sq(leadData.email)}' LIMIT 1`);
+      const rl = await axios.get(`${tok.instance_url}/services/data/${SF_API_VERSION}/query?q=${qL}`, { headers: H });
+      if (rl.data?.records?.[0]) {
+        existingRecord = { type: 'Lead', id: rl.data.records[0].Id };
+      }
+    }
+
+    // If duplicate found, return info about existing record
+    if (existingRecord) {
+      console.log(`⚠️  DUPLICATE FOUND: ${existingRecord.type} ${existingRecord.id} already exists for ${leadData.email}`);
+      const duration = Date.now() - startTime;
+      return res.json({
+        ok: true,
+        duplicate: true,
+        existingRecordType: existingRecord.type,
+        existingRecordId: existingRecord.id,
+        message: `${existingRecord.type} already exists for this email`,
+        processingTime: `${duration}ms`
+      });
+    }
+
+    // ---- Build Lead payload for Salesforce ----
+    const leadPayload = {
+      // Required fields
+      FirstName: leadData.firstName,
+      LastName: leadData.lastName,
+      Company: leadData.company,
+      Email: leadData.email,
+      
+      // Optional core fields
+      ...(leadData.mobilePhone && { MobilePhone: leadData.mobilePhone }),
+      ...(leadData.phone && { Phone: leadData.phone }),
+      ...(leadData.leadSource && { LeadSource: leadData.leadSource }),
+      ...(leadData.leadStatus && { Status: leadData.leadStatus }),
+      ...(leadData.title && { Title: leadData.title }),
+      ...(leadData.website && { Website: leadData.website }),
+      ...(leadData.industry && { Industry: leadData.industry }),
+      ...(leadData.rating && { Rating: leadData.rating }),
+      ...(leadData.description && { Description: leadData.description }),
+      
+      // Address fields
+      ...(leadData.street && { Street: leadData.street }),
+      ...(leadData.city && { City: leadData.city }),
+      ...(leadData.state && { State: leadData.state }),
+      ...(leadData.postalCode && { PostalCode: leadData.postalCode }),
+      ...(leadData.country && { Country: leadData.country }),
+      
+      // UTM/Tracking fields (these might be custom fields - adjust API names as needed)
+      ...(leadData.gclid && { gclid__c: leadData.gclid }),
+      ...(leadData.fbclid && { fbclid__c: leadData.fbclid }),
+      ...(leadData.msclkid && { msclkid__c: leadData.msclkid }),
+      ...(leadData.lastSource && { last_source__c: leadData.lastSource }),
+      ...(leadData.lastMedium && { last_medium__c: leadData.lastMedium }),
+      ...(leadData.lastCampaign && { last_campaign__c: leadData.lastCampaign }),
+      ...(leadData.lastContent && { last_content__c: leadData.lastContent }),
+      ...(leadData.lastKeyword && { last_keyword__c: leadData.lastKeyword }),
+      ...(leadData.clientId && { client_id__c: leadData.clientId }),
+      ...(leadData.fbp && { fbp__c: leadData.fbp }),
+      ...(leadData.userAgent && { user_agent__c: leadData.userAgent }),
+      ...(leadData.firstSource && { first_source__c: leadData.firstSource }),
+      ...(leadData.firstMedium && { first_medium__c: leadData.firstMedium }),
+      ...(leadData.firstCampaign && { first_campaign__c: leadData.firstCampaign }),
+      ...(leadData.firstContent && { first_content__c: leadData.firstContent }),
+      ...(leadData.firstKeyword && { first_keyword__c: leadData.firstKeyword })
+    };
+
+    // ---- Create Lead in Salesforce ----
+    const leadResponse = await axios.post(
+      `${tok.instance_url}/services/data/${SF_API_VERSION}/sobjects/Lead`,
+      leadPayload,
+      { headers: H }
+    );
+
+    const leadId = leadResponse.data.id;
+    const duration = Date.now() - startTime;
+
+    console.log(`✅ LEAD CREATED: ${leadData.firstName} ${leadData.lastName} in ${duration}ms`);
+    console.log(`   📝 Lead ID: ${leadId}`);
+    console.log(`   📧 Email: ${leadData.email}`);
+    console.log(`   🏢 Company: ${leadData.company}`);
+    console.log(`   📱 Source: ${leadData.leadSource || 'Not specified'}`);
+
+    // ---- Response ----
+    res.json({
+      ok: true,
+      leadId,
+      firstName: leadData.firstName,
+      lastName: leadData.lastName,
+      email: leadData.email,
+      company: leadData.company,
+      leadSource: leadData.leadSource || null,
+      processingTime: `${duration}ms`,
+      salesforceUrl: `${tok.instance_url}/lightning/r/Lead/${leadId}/view`
+    });
+
+  } catch (e) {
+    const duration = Date.now() - startTime;
+    console.error(`❌ LEAD WEBHOOK FAILED after ${duration}ms`);
+    console.error(`   Error:`, e?.response?.data || e.message);
+    console.error(`   Request body:`, JSON.stringify(req.body, null, 2));
+    
+    // Handle Salesforce-specific errors
+    if (e.response?.data?.length > 0) {
+      const sfError = e.response.data[0];
+      console.error(`   SF Error Code: ${sfError.errorCode}`);
+      console.error(`   SF Error Message: ${sfError.message}`);
+      console.error(`   SF Error Fields: ${sfError.fields?.join(', ') || 'N/A'}`);
+    }
+    
+    res.status(500).json({ 
+      ok: false, 
+      error: e.response?.data || e.message,
+      processingTime: `${duration}ms`
+    });
+  }
+});
+
+
+
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Server listening on :${port}`));
