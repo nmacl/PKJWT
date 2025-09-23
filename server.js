@@ -58,6 +58,9 @@ app.post("/auth/sf/jwt/test", async (_, res) => {
 // ---------- Main Klaviyo Webhook ----------
 app.post("/webhooks/klaviyo", async (req, res) => {
   const startTime = Date.now();
+  let emailMessageId = null;
+  let personId = null;
+  let accountId = null;
   
   try {
     if (process.env.KLAVIYO_SECRET) {
@@ -109,29 +112,39 @@ app.post("/webhooks/klaviyo", async (req, res) => {
     const tok = await getSfToken();
     const H = { Authorization: `Bearer ${tok.access_token}` };
 
-    let personId = null;   // Contact.Id or Lead.Id
-    let accountId = null;  // Contact.AccountId (if Contact)
     let fromUserId = null; // User.Id for your integration user
 
     if (toAddr) {
       // Try Contact first (grab AccountId for RelatedToId)
-      const qC = encodeURIComponent(`SELECT Id, AccountId FROM Contact WHERE Email='${sq(toAddr)}' LIMIT 1`);
-      const rc = await axios.get(`${tok.instance_url}/services/data/${SF_API_VERSION}/query?q=${qC}`, { headers: H });
-      personId = rc.data?.records?.[0]?.Id || null;
-      accountId = rc.data?.records?.[0]?.AccountId || null;
+      try {
+        const qC = encodeURIComponent(`SELECT Id, AccountId FROM Contact WHERE Email='${sq(toAddr)}' LIMIT 1`);
+        const rc = await axios.get(`${tok.instance_url}/services/data/${SF_API_VERSION}/query?q=${qC}`, { headers: H });
+        personId = rc.data?.records?.[0]?.Id || null;
+        accountId = rc.data?.records?.[0]?.AccountId || null;
+      } catch (contactError) {
+        console.log(`⚠️ Error querying Contact: ${contactError.message}`);
+      }
 
       // Fall back to Lead
       if (!personId) {
-        const qL = encodeURIComponent(`SELECT Id FROM Lead WHERE Email='${sq(toAddr)}' LIMIT 1`);
-        const rl = await axios.get(`${tok.instance_url}/services/data/${SF_API_VERSION}/query?q=${qL}`, { headers: H });
-        personId = rl.data?.records?.[0]?.Id || null;
+        try {
+          const qL = encodeURIComponent(`SELECT Id FROM Lead WHERE Email='${sq(toAddr)}' LIMIT 1`);
+          const rl = await axios.get(`${tok.instance_url}/services/data/${SF_API_VERSION}/query?q=${qL}`, { headers: H });
+          personId = rl.data?.records?.[0]?.Id || null;
+        } catch (leadError) {
+          console.log(`⚠️ Error querying Lead: ${leadError.message}`);
+        }
       }
     }
 
     if (process.env.SF_USERNAME) {
-      const qU = encodeURIComponent(`SELECT Id FROM User WHERE Username='${sq(process.env.SF_USERNAME)}' LIMIT 1`);
-      const ru = await axios.get(`${tok.instance_url}/services/data/${SF_API_VERSION}/query?q=${qU}`, { headers: H });
-      fromUserId = ru.data?.records?.[0]?.Id || null;
+      try {
+        const qU = encodeURIComponent(`SELECT Id FROM User WHERE Username='${sq(process.env.SF_USERNAME)}' LIMIT 1`);
+        const ru = await axios.get(`${tok.instance_url}/services/data/${SF_API_VERSION}/query?q=${qU}`, { headers: H });
+        fromUserId = ru.data?.records?.[0]?.Id || null;
+      } catch (userError) {
+        console.log(`⚠️ Error querying User: ${userError.message}`);
+      }
     }
 
     const formatCurrency = (amount, currency = 'USD') => {
@@ -263,16 +276,32 @@ app.post("/webhooks/klaviyo", async (req, res) => {
       ...(accountId ? { RelatedToId: accountId } : {}) // <-- shows on Account
     };
 
+    // This is the critical part - if this fails, we want to know about it
     const emr = await axios.post(
       `${tok.instance_url}/services/data/${SF_API_VERSION}/sobjects/EmailMessage`,
       emailMsgPayload,
       { headers: H }
     );
-    const emailMessageId = emr.data.id;
+    emailMessageId = emr.data.id;
+    console.log(`✅ EmailMessage created: ${emailMessageId}`);
 
-    const relEndpoint = `${tok.instance_url}/services/data/${SF_API_VERSION}/sobjects/EmailMessageRelation`;
+  } catch (e) {
+    // If EmailMessage creation failed, this is a real error we should report
+    const duration = Date.now() - startTime;
+    console.error(`❌ WEBHOOK FAILED after ${duration}ms`);
+    console.error(`   Error:`, e?.response?.data || e.message);
+    console.error(`   Stack:`, e.stack);
+    
+    return res.status(500).json({ ok: false, error: e.response?.data || e.message });
+  }
 
-    // Tie to Contact/Lead as recipient
+  // If we get here, EmailMessage was created successfully
+  // Now try to create relations, but don't fail the webhook if these don't work
+  
+  const relEndpoint = `${tok.instance_url}/services/data/${SF_API_VERSION}/sobjects/EmailMessageRelation`;
+  const H = { Authorization: `Bearer ${(await getSfToken()).access_token}` };
+
+  // Try to create person relation
   if (personId) {
     try {
       await axios.post(relEndpoint, {
@@ -280,59 +309,67 @@ app.post("/webhooks/klaviyo", async (req, res) => {
         RelationId: personId,
         RelationType: "ToAddress"
       }, { headers: H });
+      console.log(`✅ ToAddress relation created for ${personId}`);
     } catch (err) {
-      // If ToAddress fails, try CcAddress instead of RelatedTo
+      console.log(`⚠️ ToAddress failed for ${personId}:`, err?.response?.data || err.message);
+      
       try {
         await axios.post(relEndpoint, {
           EmailMessageId: emailMessageId,
           RelationId: personId,
           RelationType: "CcAddress"
         }, { headers: H });
+        console.log(`✅ CcAddress relation created for ${personId}`);
       } catch (err2) {
-        // If both fail, just skip the relation - the EmailMessage will still be created
-        console.log(`⚠️ Could not create EmailMessageRelation for person ${personId}`);
+        console.log(`⚠️ CcAddress also failed for ${personId}:`, err2?.response?.data || err2.message);
+        // Don't throw - EmailMessage was created successfully
       }
     }
   }
 
-    // Tie the sender user (optional)
-    if (fromUserId) {
-      try {
-        await axios.post(relEndpoint, {
-          EmailMessageId: emailMessageId,
-          RelationId: fromUserId,
-          RelationType: "FromAddress"
-        }, { headers: H });
-      } catch {
-        // ignore if not allowed
-      }
+  // Try to create sender relation
+  let fromUserId = null;
+  if (process.env.SF_USERNAME) {
+    try {
+      const qU = encodeURIComponent(`SELECT Id FROM User WHERE Username='${sq(process.env.SF_USERNAME)}' LIMIT 1`);
+      const ru = await axios.get(`${(await getSfToken()).instance_url}/services/data/${SF_API_VERSION}/query?q=${qU}`, { headers: H });
+      fromUserId = ru.data?.records?.[0]?.Id || null;
+    } catch (userError) {
+      console.log(`⚠️ Error querying User: ${userError.message}`);
     }
-
-    const duration = Date.now() - startTime;
-    console.log(`✅ SUCCESS: Order #${orderId} logged to Salesforce in ${duration}ms`);
-    console.log(`   📧 EmailMessage ID: ${emailMessageId}`);
-    console.log(`   👤 Person ID: ${personId || 'none'}`);
-    console.log(`   🏢 Account ID: ${accountId || 'none'}`);
-
-    res.json({
-      ok: true,
-      emailMessageId,
-      linkedPersonId: personId,
-      relatedToAccountId: accountId || null,
-      subject,
-      to: toAddr,
-      orderTotal: orderData?.$value,
-      itemCount: orderData?.TotalNumbersOfItemsOrdered
-    });
-
-  } catch (e) {
-    const duration = Date.now() - startTime;
-    console.error(`❌ WEBHOOK FAILED after ${duration}ms`);
-    console.error(`   Error:`, e?.response?.data || e.message);
-    console.error(`   Stack:`, e.stack);
-    
-    res.status(500).json({ ok: false, error: e.response?.data || e.message });
   }
+
+  if (fromUserId) {
+    try {
+      await axios.post(relEndpoint, {
+        EmailMessageId: emailMessageId,
+        RelationId: fromUserId,
+        RelationType: "FromAddress"
+      }, { headers: H });
+      console.log(`✅ FromAddress relation created for ${fromUserId}`);
+    } catch (senderErr) {
+      console.log(`⚠️ FromAddress relation failed:`, senderErr?.response?.data || senderErr.message);
+      // Don't throw - this is optional
+    }
+  }
+
+  // Always return success since EmailMessage was created
+  const duration = Date.now() - startTime;
+  console.log(`✅ SUCCESS: Order #${orderData?.OrderId || 'N/A'} logged to Salesforce in ${duration}ms`);
+  console.log(`   📧 EmailMessage ID: ${emailMessageId}`);
+  console.log(`   👤 Person ID: ${personId || 'none'}`);
+  console.log(`   🏢 Account ID: ${accountId || 'none'}`);
+
+  res.json({
+    ok: true,
+    emailMessageId,
+    linkedPersonId: personId,
+    relatedToAccountId: accountId || null,
+    subject: req.body?.subject || `Order Confirmation: #${orderData?.OrderId || 'N/A'}`,
+    to: req.body?.email || orderData?.BillingAddress?.Email || orderData?.ShippingAddress?.Email || "",
+    orderTotal: orderData?.$value,
+    itemCount: orderData?.TotalNumbersOfItemsOrdered
+  });
 });
 
 app.post("/webhooks/salesforce", async (req, res) => {
