@@ -273,22 +273,27 @@ app.post("/webhooks/klaviyo", async (req, res) => {
     const relEndpoint = `${tok.instance_url}/services/data/${SF_API_VERSION}/sobjects/EmailMessageRelation`;
 
     // Tie to Contact/Lead as recipient
-    if (personId) {
+  if (personId) {
+    try {
+      await axios.post(relEndpoint, {
+        EmailMessageId: emailMessageId,
+        RelationId: personId,
+        RelationType: "ToAddress"
+      }, { headers: H });
+    } catch (err) {
+      // If ToAddress fails, try CcAddress instead of RelatedTo
       try {
         await axios.post(relEndpoint, {
           EmailMessageId: emailMessageId,
           RelationId: personId,
-          RelationType: "ToAddress"
+          RelationType: "CcAddress"
         }, { headers: H });
-      } catch {
-        // Fallback if org restricts RelationType
-        await axios.post(relEndpoint, {
-          EmailMessageId: emailMessageId,
-          RelationId: personId,
-          RelationType: "RelatedTo"
-        }, { headers: H });
+      } catch (err2) {
+        // If both fail, just skip the relation - the EmailMessage will still be created
+        console.log(`⚠️ Could not create EmailMessageRelation for person ${personId}`);
       }
     }
+  }
 
     // Tie the sender user (optional)
     if (fromUserId) {
